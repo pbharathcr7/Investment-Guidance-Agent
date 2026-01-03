@@ -9,15 +9,22 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 import yfinance as yf
 import requests
 import json
+import streamlit as st
 
 load_dotenv()
 
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-SERP_API_KEY = os.getenv("SERP_API_KEY")
-Model_Name = os.getenv("Model_Name")
+try:
+    GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
+    SERP_API_KEY = st.secrets["SERP_API_KEY"]
+    Model_Name = st.secrets["Model_Name"]
+except:
+    # Fallback for local development
+    GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+    SERP_API_KEY = os.getenv("SERP_API_KEY")
+    Model_Name = os.getenv("Model_Name")
 
 # ============================================================================
 # STATE DEFINITION
