@@ -2,6 +2,7 @@
 from typing import TypedDict, Annotated, List, Dict
 import operator
 from datetime import datetime
+import math
 from dotenv import load_dotenv
 from langgraph.graph import StateGraph, END
 from langchain_google_genai import ChatGoogleGenerativeAI
@@ -38,6 +39,41 @@ class InvestmentAgentState(TypedDict):
     query_type: str
     final_response: str
     messages: Annotated[List[str], operator.add]
+
+
+def _content_to_text(content) -> str:
+    """Normalize LangChain message content (str/list/dict) into plain text."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict):
+                text_val = item.get("text") or item.get("content")
+                if text_val:
+                    parts.append(str(text_val))
+                else:
+                    parts.append(str(item))
+            else:
+                parts.append(str(item))
+        return "\n".join(parts)
+    if isinstance(content, dict):
+        return str(content.get("text") or content.get("content") or content)
+    return str(content)
+
+
+def _sanitize_json_values(value):
+    """Convert NaN/Inf to None so json.dumps emits valid JSON for Gemini."""
+    if isinstance(value, dict):
+        return {k: _sanitize_json_values(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_sanitize_json_values(v) for v in value]
+    if isinstance(value, float):
+        if math.isnan(value) or math.isinf(value):
+            return None
+    return value
 
 
 # ============================================================================
@@ -95,7 +131,7 @@ def fetch_stock_data(symbol: str) -> str:
         if isinstance(div_yield, float):
             div_yield = f"{div_yield * 100:.2f}%"
 
-        return json.dumps({
+        payload = {
             "symbol": symbol,
             "company_name": info.get("longName", info.get("shortName", symbol)),
             "currency": info.get("currency", "USD"),
@@ -114,7 +150,9 @@ def fetch_stock_data(symbol: str) -> str:
             "revenue_growth": rev_growth,
             "profit_margin": profit_margin,
             "description": (info.get("longBusinessSummary", "") or "")[:300],
-        })
+        }
+        payload = _sanitize_json_values(payload)
+        return json.dumps(payload, allow_nan=False)
     except Exception as e:
         return json.dumps({"error": str(e)})
 
@@ -223,9 +261,47 @@ def _run_react_loop(
     tool_registry: dict,
     max_iterations: int = 5,
 ) -> str:
+    def _finalize_without_tools(base_messages: list) -> str:
+        """Fallback finalizer for Gemini thought_signature/tool-call incompatibilities."""
+        plain_llm = ChatGoogleGenerativeAI(
+            model=Model_Name,
+            google_api_key=GEMINI_API_KEY,
+            temperature=0.2,
+        )
+
+        tool_outputs = []
+        for msg in base_messages:
+            if isinstance(msg, ToolMessage):
+                tool_outputs.append(str(msg.content))
+
+        fallback_messages = [
+            msg for msg in base_messages if isinstance(msg, (SystemMessage, HumanMessage))
+        ]
+
+        if tool_outputs:
+            fallback_messages.append(
+                HumanMessage(
+                    content=(
+                        "Tool outputs were collected. Use them to produce the final answer. "
+                        "Do not call any tools.\n\n"
+                        "TOOL OUTPUTS:\n"
+                        + "\n\n".join(tool_outputs)
+                    )
+                )
+            )
+
+        final = plain_llm.invoke(fallback_messages)
+        return _content_to_text(final.content) if hasattr(final, "content") else str(final)
+
     response = None
-    for _ in range(max_iterations):
-        response = llm_with_tools.invoke(messages)
+    for i in range(max_iterations):
+        try:
+            response = llm_with_tools.invoke(messages)
+        except Exception as e:
+            error_text = str(e)
+            if "thought_signature" in error_text:
+                return _finalize_without_tools(messages)
+            raise
         messages.append(response)
 
         if not getattr(response, "tool_calls", None):
@@ -244,7 +320,6 @@ def _run_react_loop(
             else:
                 try:
                     result = tool_fn.invoke(tool_args)
-                    print(f"  [TOOL] {tool_name}({list(tool_args.keys())})")
                 except Exception as e:
                     result = f"Tool error from {tool_name}: {str(e)}"
 
@@ -254,7 +329,7 @@ def _run_react_loop(
 
     if response is None:
         return "No response generated."
-    return response.content if hasattr(response, "content") else str(response)
+    return _content_to_text(response.content) if hasattr(response, "content") else str(response)
 
 
 # ============================================================================
@@ -263,7 +338,6 @@ def _run_react_loop(
 
 def classify_query_node(state: InvestmentAgentState) -> Dict:
     """One lightweight LLM call — outputs a single routing word, nothing more."""
-    print("[NODE] classify_query")
     llm = ChatGoogleGenerativeAI(
         model=Model_Name, google_api_key=GEMINI_API_KEY, temperature=0
     )
@@ -275,7 +349,7 @@ def classify_query_node(state: InvestmentAgentState) -> Dict:
         f'- off_topic      : not related to investments or finance\n\n'
         f'Query: "{state["user_query"]}"'
     )
-    raw = response.content.strip().lower()
+    raw = _content_to_text(response.content).strip().lower()
     if "single_stock" in raw:
         query_type = "single_stock"
     elif "off_topic" in raw:
@@ -283,13 +357,11 @@ def classify_query_node(state: InvestmentAgentState) -> Dict:
     else:
         query_type = "general_advice"
 
-    print(f"  → {query_type}")
     return {"query_type": query_type, "messages": [f"Classified: {query_type}"]}
 
 
 def handle_off_topic_node(state: InvestmentAgentState) -> Dict:
     """No LLM call — static redirect. Zero token cost."""
-    print("[NODE] handle_off_topic")
     return {
         "final_response": (
             "I'm an Investment Advisor AI — I can only help with stock analysis and financial guidance.\n\n"
@@ -305,7 +377,6 @@ def handle_off_topic_node(state: InvestmentAgentState) -> Dict:
 
 def general_advisor_agent(state: InvestmentAgentState) -> Dict:
     """ReAct agent with optional tools. LLM decides whether to search web or fetch indices."""
-    print("[NODE] general_advisor_agent")
     llm = ChatGoogleGenerativeAI(
         model=Model_Name, google_api_key=GEMINI_API_KEY, temperature=0.2
     )
@@ -344,7 +415,6 @@ def general_advisor_agent(state: InvestmentAgentState) -> Dict:
 
 def stock_analysis_agent(state: InvestmentAgentState) -> Dict:
     """ReAct agent: fetches stock data + news via tools, then writes one complete report."""
-    print("[NODE] stock_analysis_agent")
     llm = ChatGoogleGenerativeAI(
         model=Model_Name, google_api_key=GEMINI_API_KEY, temperature=0.2
     )
@@ -422,7 +492,8 @@ def create_investment_agent():
     workflow.add_edge("general_advisor", END)
     workflow.add_edge("stock_analysis", END)
 
-    return workflow.compile()
+    compiled = workflow.compile()
+    return compiled
 
 
 # ============================================================================
@@ -447,11 +518,7 @@ def run_investment_agent(user_query: str, user_profile: Dict = None):
         "messages": [],
     }
 
-    print("Analyzing your question...")
-    print("─" * 60)
-
     agent = create_investment_agent()
     final_state = agent.invoke(initial_state)
 
-    print("\n" + final_state["final_response"])
     return final_state
