@@ -1,11 +1,12 @@
-import os
+﻿import os
 from typing import TypedDict, Annotated, List, Dict
 import operator
-import uuid
-from datetime import datetime, timedelta
+from datetime import datetime
 from dotenv import load_dotenv
 from langgraph.graph import StateGraph, END
 from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_core.tools import tool
+from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage
 import yfinance as yf
 import requests
 import json
@@ -17,1046 +18,440 @@ load_dotenv()
 # CONFIGURATION
 # ============================================================================
 try:
-    GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
-    SERP_API_KEY = st.secrets["SERP_API_KEY"]
-    Model_Name = st.secrets["Model_Name"]
-except:
-    # Fallback for local development
+    GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+    SERP_API_KEY = os.getenv("SERP_API_KEY")
+    Model_Name = os.getenv("Model_Name")
+except Exception:
     GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
     SERP_API_KEY = os.getenv("SERP_API_KEY")
     Model_Name = os.getenv("Model_Name")
 
 # ============================================================================
-# STATE DEFINITION
+# STATE — 5 fields only.
+# Intermediate analysis data lives inside the agent's own message history,
+# NOT in graph state — no token waste passing large strings between nodes.
 # ============================================================================
 
 class InvestmentAgentState(TypedDict):
     user_query: str
     user_profile: Dict[str, any]
     query_type: str
-    company_name: str
-    stock_symbol: str
-    exchange: str
-    current_price: float
-    stock_data: Dict[str, any]
-    news_articles: List[Dict[str, str]]
-    market_conditions: str
-    business_analysis: str
-    valuation_analysis: str
-    momentum_analysis: str
-    news_sentiment: str
-    price_prediction: str
-    risk_assessment: str
-    recommendation: str
-    general_advice: str
     final_response: str
     messages: Annotated[List[str], operator.add]
 
+
 # ============================================================================
-# TOOLS
+# TOOLS — all data access is @tool so agents decide when to call them
 # ============================================================================
 
-def search_web(query: str) -> str:
-    """Search the web using SerpAPI and return formatted results"""
+@tool("fetch_stock_data")
+def fetch_stock_data(symbol: str) -> str:
+    """Fetch real-time price, fundamentals, and 52-week range for a stock ticker.
+    Use standard ticker symbols: AAPL, RELIANCE.NS, TCS.NS, HDFCBANK.NS, etc.
+    For Indian stocks append .NS (NSE) or .BO (BSE). US stocks need no suffix."""
     try:
-        url = "https://serpapi.com/search"
+        stock = yf.Ticker(symbol)
+        hist = stock.history(period="1y")
+
+        # Auto-retry with common suffixes if symbol not found
+        if hist.empty:
+            base = symbol.split(".")[0]
+            for suffix in [".NS", ".BO", ".L", ""]:
+                alt = base + suffix if suffix else base
+                if alt == symbol:
+                    continue
+                stock = yf.Ticker(alt)
+                hist = stock.history(period="1y")
+                if not hist.empty:
+                    symbol = alt
+                    break
+
+        if hist.empty:
+            return json.dumps({"error": f"No market data found for '{symbol}'. Check the ticker symbol."})
+
+        info = stock.info
+        current_price = float(hist["Close"].iloc[-1])
+        prev_close = float(hist["Close"].iloc[-2]) if len(hist) > 1 else current_price
+        change_pct = ((current_price - prev_close) / prev_close) * 100
+
+        market_cap = info.get("marketCap", "N/A")
+        if isinstance(market_cap, (int, float)):
+            if market_cap >= 1e12:
+                market_cap = f"{market_cap / 1e12:.2f}T"
+            elif market_cap >= 1e9:
+                market_cap = f"{market_cap / 1e9:.2f}B"
+            else:
+                market_cap = f"{market_cap / 1e6:.2f}M"
+
+        rev_growth = info.get("revenueGrowth", "N/A")
+        if isinstance(rev_growth, float):
+            rev_growth = f"{rev_growth * 100:.1f}%"
+
+        profit_margin = info.get("profitMargins", "N/A")
+        if isinstance(profit_margin, float):
+            profit_margin = f"{profit_margin * 100:.1f}%"
+
+        div_yield = info.get("dividendYield", "N/A")
+        if isinstance(div_yield, float):
+            div_yield = f"{div_yield * 100:.2f}%"
+
+        return json.dumps({
+            "symbol": symbol,
+            "company_name": info.get("longName", info.get("shortName", symbol)),
+            "currency": info.get("currency", "USD"),
+            "exchange": info.get("exchange", "N/A"),
+            "country": info.get("country", "N/A"),
+            "sector": info.get("sector", "N/A"),
+            "industry": info.get("industry", "N/A"),
+            "price": round(current_price, 2),
+            "change_percent": f"{change_pct:.2f}%",
+            "52_week_high": round(float(hist["High"].max()), 2),
+            "52_week_low": round(float(hist["Low"].min()), 2),
+            "market_cap": market_cap,
+            "pe_ratio": info.get("trailingPE", "N/A"),
+            "forward_pe": info.get("forwardPE", "N/A"),
+            "dividend_yield": div_yield,
+            "revenue_growth": rev_growth,
+            "profit_margin": profit_margin,
+            "description": (info.get("longBusinessSummary", "") or "")[:300],
+        })
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+@tool("fetch_stock_news")
+def fetch_stock_news(query: str) -> str:
+    """Fetch the latest news headlines and snippets for a stock or company.
+    Pass ticker + company name as query, e.g. 'AAPL Apple' or 'TCS.NS Tata Consultancy'."""
+    try:
+        params = {
+            "q": f"{query} stock news",
+            "api_key": SERP_API_KEY,
+            "engine": "google",
+            "tbm": "nws",
+            "num": 5,
+        }
+        data = requests.get("https://serpapi.com/search", params=params, timeout=10).json()
+        articles = [
+            f"- {a.get('title', '')} [{a.get('source', '')}, {a.get('date', '')}]: {a.get('snippet', '')}"
+            for a in data.get("news_results", [])[:5]
+        ]
+        return "\n".join(articles) if articles else "No recent news found."
+    except Exception as e:
+        return f"News fetch error: {str(e)}"
+
+
+@tool("search_web")
+def search_web(query: str) -> str:
+    """Search the web for market context, sector trends, commodity prices, macro news, etc."""
+    try:
         params = {
             "q": query,
             "api_key": SERP_API_KEY,
             "engine": "google",
-            "num": 5
+            "num": 5,
         }
-        
-        response = requests.get(url, params=params, timeout=10)
-        data = response.json()
-        
-        results = []
-        # Get organic results
-        for item in data.get("organic_results", [])[:5]:
-            results.append({
-                "title": item.get("title", ""),
-                "snippet": item.get("snippet", ""),
-                "link": item.get("link", "")
-            })
-        
-        # Format for LLM
-        formatted = "\n\n".join([
-            f"Source: {r['title']}\n{r['snippet']}\nURL: {r['link']}"
-            for r in results
-        ])
-        
-        return formatted if formatted else "No results found"
+        data = requests.get("https://serpapi.com/search", params=params, timeout=10).json()
+        results = [
+            f"[{r.get('title', '')}]\n{r.get('snippet', '')}"
+            for r in data.get("organic_results", [])[:5]
+        ]
+        return "\n\n".join(results) if results else "No results found."
     except Exception as e:
         return f"Search error: {str(e)}"
 
 
-def resolve_stock_symbol(query: str, llm) -> Dict[str, str]:
-    """Use LLM to extract company name and resolve to proper ticker symbol"""
-    
-    prompt = f"""You are a stock symbol resolver. Extract the company/stock from this query and find its ticker symbol.
-
-    Query: "{query}"
-
-    Respond in this EXACT JSON format:
-    {{
-        "company_name": "Full Company Name",
-        "symbol": "TICKER",
-        "exchange": "NSE" or "BSE" or "NYSE" or "NASDAQ" or "LSE"
-    }}
-
-    Examples:
-    - "Reliance Industries" → {{"company_name": "Reliance Industries", "symbol": "RELIANCE.NS", "exchange": "NSE"}}
-    - "TCS" → {{"company_name": "Tata Consultancy Services", "symbol": "TCS.NS", "exchange": "NSE"}}
-    - "Apple" → {{"company_name": "Apple Inc.", "symbol": "AAPL", "exchange": "NASDAQ"}}
-    - "HDFC Bank" → {{"company_name": "HDFC Bank", "symbol": "HDFCBANK.NS", "exchange": "NSE"}}
-
-    For Indian stocks, use .NS suffix (NSE) or .BO suffix (BSE).
-    For US stocks, no suffix needed.
-
-    Respond ONLY with the JSON."""
-    
-    try:
-        response = llm.invoke(prompt)
-        content = response.content.strip()
-        
-        # Clean up response if it has markdown code blocks
-        if "```json" in content:
-            content = content.split("```json")[1].split("```")[0].strip()
-        elif "```" in content:
-            content = content.split("```")[1].split("```")[0].strip()
-        
-        result = json.loads(content)
-        
-        return {
-            "company_name": result.get("company_name", ""),
-            "symbol": result.get("symbol", ""),
-            "exchange": result.get("exchange", "")
-        }
-    except Exception as e:
-        query_upper = query.upper().strip()
-        return {
-            "company_name": query,
-            "symbol": query_upper,
-            "exchange": "UNKNOWN"
-        }
-
-
-def fetch_global_stock_data(symbol: str) -> Dict[str, any]:
-    """Fetch stock data using yfinance (supports global stocks)"""
-    try:
-        stock = yf.Ticker(symbol)
-        info = stock.info
-        hist = stock.history(period="1y")
-        
-        if hist.empty:
-            return {"error": f"No data found for {symbol}"}
-        
-        current_price = hist['Close'].iloc[-1]
-        prev_close = hist['Close'].iloc[-2] if len(hist) > 1 else current_price
-        change = current_price - prev_close
-        change_percent = (change / prev_close) * 100
-        
-        high_52w = hist['High'].max()
-        low_52w = hist['Low'].min()
-        
-        return {
-            "symbol": symbol,
-            "price": round(float(current_price), 2),
-            "change": round(float(change), 2),
-            "change_percent": f"{change_percent:.2f}%",
-            "volume": info.get("volume", "N/A"),
-            "company_name": info.get("longName", info.get("shortName", symbol)),
-            "sector": info.get("sector", "N/A"),
-            "industry": info.get("industry", "N/A"),
-            "market_cap": info.get("marketCap", "N/A"),
-            "pe_ratio": info.get("trailingPE", "N/A"),
-            "forward_pe": info.get("forwardPE", "N/A"),
-            "dividend_yield": info.get("dividendYield", "N/A"),
-            "52_week_high": round(float(high_52w), 2),
-            "52_week_low": round(float(low_52w), 2),
-            "profit_margin": info.get("profitMargins", "N/A"),
-            "revenue_growth": info.get("revenueGrowth", "N/A"),
-            "description": info.get("longBusinessSummary", ""),
-            "currency": info.get("currency", "USD"),
-            "exchange": info.get("exchange", "N/A"),
-            "country": info.get("country", "N/A")
-        }
-    except Exception as e:
-        return {"error": f"Failed to fetch stock data: {str(e)}"}
-
-
-def search_stock_news(symbol: str, company_name: str) -> List[Dict[str, str]]:
-    """Search for stock news using SerpAPI"""
-    try:
-        search_query = f"{symbol} {company_name} stock news"
-        url = "https://serpapi.com/search"
-        params = {
-            "q": search_query,
-            "api_key": SERP_API_KEY,
-            "engine": "google",
-            "num": 5,
-            "tbm": "nws"
-        }
-        
-        response = requests.get(url, params=params, timeout=10)
-        data = response.json()
-        news_results = data.get("news_results", [])
-        
-        articles = []
-        for item in news_results[:5]:
-            articles.append({
-                "title": item.get("title", ""),
-                "snippet": item.get("snippet", ""),
-                "source": item.get("source", ""),
-                "date": item.get("date", "")
-            })
-        
-        return articles if articles else [{"title": "No recent news found", "snippet": "", "source": "", "date": ""}]
-    except Exception as e:
-        return [{"title": "Unable to fetch news", "snippet": str(e), "source": "", "date": ""}]
-
-
-def get_market_indices() -> Dict[str, any]:
-    """Get current market indices data"""
+@tool("get_market_indices")
+def get_market_indices() -> str:
+    """Fetch current values and daily % change for S&P 500, NIFTY 50, Dow Jones, and NASDAQ."""
     indices = {
         "S&P 500": "^GSPC",
         "NIFTY 50": "^NSEI",
         "Dow Jones": "^DJI",
-        "NASDAQ": "^IXIC"
+        "NASDAQ": "^IXIC",
     }
-    
-    results = {}
-    for name, symbol in indices.items():
+    lines = []
+    for name, sym in indices.items():
         try:
-            ticker = yf.Ticker(symbol)
-            hist = ticker.history(period="5d")
+            hist = yf.Ticker(sym).history(period="5d")
             if not hist.empty:
-                current = hist['Close'].iloc[-1]
-                prev = hist['Close'].iloc[-2] if len(hist) > 1 else current
-                change_pct = ((current - prev) / prev) * 100
-                results[name] = {
-                    "value": round(float(current), 2),
-                    "change_percent": f"{change_pct:.2f}%"
-                }
-        except:
-            results[name] = {"value": "N/A", "change_percent": "N/A"}
-    
-    return results
+                cur = float(hist["Close"].iloc[-1])
+                prev = float(hist["Close"].iloc[-2]) if len(hist) > 1 else cur
+                pct = ((cur - prev) / prev) * 100
+                lines.append(f"{name}: {cur:,.2f} ({pct:+.2f}%)")
+            else:
+                lines.append(f"{name}: N/A")
+        except Exception:
+            lines.append(f"{name}: N/A")
+    return "\n".join(lines)
 
 
-def calculate_what_if(symbol: str, months_ago: int, investment_amount: float) -> Dict:
-    """Calculate hypothetical returns if invested X months ago"""
+@tool("calculate_what_if")
+def calculate_what_if(symbol: str, months_ago: int, investment_amount: float) -> str:
+    """Calculate hypothetical returns if someone had invested a fixed amount X months ago.
+    Returns purchase price, shares bought, current value, profit/loss, and return %."""
     try:
-        stock = yf.Ticker(symbol)
-        hist = stock.history(period=f"{months_ago+1}mo")
-        
+        hist = yf.Ticker(symbol).history(period=f"{months_ago + 1}mo")
         if len(hist) < 2:
-            return {"error": "Insufficient historical data"}
-        
-        old_price = hist['Close'].iloc[0]
-        current_price = hist['Close'].iloc[-1]
-        
+            return "Insufficient historical data for this period."
+        old_price = float(hist["Close"].iloc[0])
+        cur_price = float(hist["Close"].iloc[-1])
         shares = investment_amount / old_price
-        current_value = shares * current_price
+        current_value = shares * cur_price
         profit = current_value - investment_amount
         return_pct = (profit / investment_amount) * 100
-        
-        return {
-            "investment_amount": investment_amount,
-            "purchase_price": round(float(old_price), 2),
-            "current_price": round(float(current_price), 2),
-            "shares_bought": round(shares, 2),
-            "current_value": round(float(current_value), 2),
-            "profit_loss": round(float(profit), 2),
-            "return_percent": round(float(return_pct), 2)
-        }
+        return (
+            f"If you had invested {investment_amount:,.0f} in {symbol} {months_ago} months ago:\n"
+            f"  Purchase price : {old_price:.2f}\n"
+            f"  Shares bought  : {shares:.4f}\n"
+            f"  Current value  : {current_value:,.2f}\n"
+            f"  Profit / Loss  : {profit:+,.2f} ({return_pct:+.1f}%)"
+        )
     except Exception as e:
-        return {"error": str(e)}
+        return f"Calculation error: {str(e)}"
 
 
 # ============================================================================
-# NODE FUNCTIONS - CLASSIFIER
+# SHARED REACT LOOP
+# One shared helper — LLM decides which tools to call, executes them,
+# feeds results back, repeats until LLM returns a final plain-text answer.
+# ============================================================================
+
+def _run_react_loop(
+    llm_with_tools,
+    messages: list,
+    tool_registry: dict,
+    max_iterations: int = 5,
+) -> str:
+    response = None
+    for _ in range(max_iterations):
+        response = llm_with_tools.invoke(messages)
+        messages.append(response)
+
+        if not getattr(response, "tool_calls", None):
+            # LLM returned a final answer — no more tool calls needed
+            break
+
+        for call in response.tool_calls:
+            tool_name = call.get("name", "") or "unknown_tool"
+            tool_args = call.get("args", {}) or {}
+            # Gemini requires tool_call_id to be non-empty
+            tool_call_id = call.get("id") or tool_name
+            tool_fn = tool_registry.get(tool_name)
+
+            if tool_fn is None:
+                result = f"Tool '{tool_name}' is not available."
+            else:
+                try:
+                    result = tool_fn.invoke(tool_args)
+                    print(f"  [TOOL] {tool_name}({list(tool_args.keys())})")
+                except Exception as e:
+                    result = f"Tool error from {tool_name}: {str(e)}"
+
+            messages.append(
+                ToolMessage(content=str(result), tool_call_id=tool_call_id, name=tool_name)
+            )
+
+    if response is None:
+        return "No response generated."
+    return response.content if hasattr(response, "content") else str(response)
+
+
+# ============================================================================
+# NODES
 # ============================================================================
 
 def classify_query_node(state: InvestmentAgentState) -> Dict:
-    """Classify if query is about single stock, general advice, or off-topic"""
-    run_id = uuid.uuid4().hex[:8]
-    print(f"[NODE RUN] classify_query - ID: {run_id}")
-    
+    """One lightweight LLM call — outputs a single routing word, nothing more."""
+    print("[NODE] classify_query")
     llm = ChatGoogleGenerativeAI(
-        model=Model_Name,
-        google_api_key=GEMINI_API_KEY,
-        temperature=0
+        model=Model_Name, google_api_key=GEMINI_API_KEY, temperature=0
     )
-    
-    prompt = f"""Classify this investment query:
-
-    Query: "{state['user_query']}"
-
-    Classification Rules:
-
-    1. "single_stock" = Asking about ONE specific company/ticker to analyze or invest in
-    Examples: 
-    * "Should I buy Apple?"
-    * "Analyze Tesla stock"
-    * "Is RELIANCE good?"
-    * "Tell me about Google stock"
-    
-    2. "general_advice" = General investment questions about markets, sectors, portfolios
-    Examples: 
-    * "What should I invest in?"
-    * "Which sectors are good now?"
-    * "Compare tech vs pharma stocks"
-    * "I have $5000, where to invest?"
-    * "Recommend some stocks"
-    * "Best investment for beginners"
-
-    3. "off_topic" = NOT related to investments, stocks, finance, or money
-    Examples:
-    * "Do you know Cristiano Ronaldo?"
-    * "I like to play video games"
-    * "How to make biryani"
-    * "What's the weather today?"
-    * "Tell me a joke"
-    * "Who won the World Cup?"
-
-    Respond with ONLY ONE WORD: single_stock OR general_advice OR off_topic"""
-    
-    response = llm.invoke(prompt)
-    query_type = response.content.strip().lower()
-    
-    # Fallback if LLM doesn't respond properly
-    if "off_topic" in query_type:
-        query_type = "off_topic"
-    elif "single_stock" in query_type:
+    response = llm.invoke(
+        f'Classify this query. Reply with ONLY ONE WORD: single_stock OR general_advice OR off_topic\n\n'
+        f'Rules:\n'
+        f'- single_stock   : asking about ONE specific company/stock (e.g. "Should I buy Apple?", "Analyze TCS")\n'
+        f'- general_advice : general investment questions, markets, sectors, portfolios\n'
+        f'- off_topic      : not related to investments or finance\n\n'
+        f'Query: "{state["user_query"]}"'
+    )
+    raw = response.content.strip().lower()
+    if "single_stock" in raw:
         query_type = "single_stock"
-    elif "general_advice" in query_type:
-        query_type = "general_advice"
+    elif "off_topic" in raw:
+        query_type = "off_topic"
     else:
-        # Default to general_advice if unclear
         query_type = "general_advice"
-    
-    print(f"📋 Query classified as: {query_type}")
-    
-    return {
-        "query_type": query_type,
-        "messages": [f"📋 Query type: {query_type}"]
-    }
 
+    print(f"  → {query_type}")
+    return {"query_type": query_type, "messages": [f"Classified: {query_type}"]}
 
-# ============================================================================
-# NODE FUNCTIONS - OFF-TOPIC PATH
-# ============================================================================
 
 def handle_off_topic_node(state: InvestmentAgentState) -> Dict:
-    """Handle off-topic queries with a polite redirect"""
-    run_id = uuid.uuid4().hex[:8]
-    print(f"[NODE RUN] handle_off_topic - ID: {run_id}")
-    
-    final_response = """
-    🤖 I'm an Investment Advisor AI
-
-    I can only help with stock analysis, investment recommendations, and financial guidance.
-
-    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-    ❌ Your question doesn't seem to be about investments or stocks.
-
-    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-    ✅ WHAT I CAN HELP WITH:
-
-    📊 Single Stock Analysis:
-    • "Should I buy Apple stock?"
-    • "Analyze Tesla right now"
-    • "Is RELIANCE.NS a good investment?"
-    • "Tell me about Microsoft stock"
-
-    💡 General Investment Advice:
-    • "What should I invest in?"
-    • "Which sectors are performing well?"
-    • "I have $5000, where should I invest?"
-    • "Recommend some tech stocks"
-    • "Compare pharma vs banking stocks"
-
-    📈 Market Insights:
-    • "What's happening in the stock market today?"
-    • "Should I invest now or wait?"
-    • "Which emerging markets look good?"
-
-    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-    💬 Try asking me one of these questions!
-    """
-    
+    """No LLM call — static redirect. Zero token cost."""
+    print("[NODE] handle_off_topic")
     return {
-        "final_response": final_response,
-        "messages": ["⚠️ Off-topic query handled"]
+        "final_response": (
+            "I'm an Investment Advisor AI — I can only help with stock analysis and financial guidance.\n\n"
+            "Try asking:\n"
+            '• "Should I buy Apple stock?"\n'
+            '• "What sectors are performing well right now?"\n'
+            '• "I have $5000, where should I invest?"\n'
+            '• "Analyze TCS stock for me"'
+        ),
+        "messages": ["Off-topic handled"],
     }
 
 
-# ============================================================================
-# NODE FUNCTIONS - GENERAL ADVICE PATH
-# ============================================================================
-
-def general_advisor_node(state: InvestmentAgentState) -> Dict:
-    """Provide general investment advice using web search + LLM"""
-    run_id = uuid.uuid4().hex[:8]
-    print(f"[NODE RUN] general_advisor - ID: {run_id}")
-    
+def general_advisor_agent(state: InvestmentAgentState) -> Dict:
+    """ReAct agent with optional tools. LLM decides whether to search web or fetch indices."""
+    print("[NODE] general_advisor_agent")
     llm = ChatGoogleGenerativeAI(
-        model=Model_Name,
-        google_api_key=GEMINI_API_KEY,
-        temperature=0.3
+        model=Model_Name, google_api_key=GEMINI_API_KEY, temperature=0.2
     )
-    
-    # Get current date
+    llm_with_tools = llm.bind_tools([search_web, get_market_indices])
+
     today = datetime.now().strftime("%B %Y")
-    
-    # Search for current market conditions
-    print("🔍 Searching market conditions...")
-    market_search = search_web(f"stock market conditions {today} best sectors invest")
-    
-    # Search for gold/silver prices and trends
-    print("🪙 Searching gold and silver prices...")
-    gold_search = search_web(f"gold price today {today} investment trend India")
-    silver_search = search_web(f"silver price today {today} investment trend")
-    
-    # Get market indices
-    print("📊 Fetching market indices...")
-    indices = get_market_indices()
-    indices_text = "\n".join([f"- {name}: {data['value']} ({data['change_percent']})" 
-                              for name, data in indices.items()])
-    
-    # Build comprehensive prompt
-    prompt = f"""You are a personal investment advisor who considers ALL investment options, not just stocks.
 
-    USER PROFILE:
-    - Risk Tolerance: {state['user_profile'].get('risk_tolerance', 'N/A')}
-    - Investment Horizon: {state['user_profile'].get('investment_horizon', 'N/A')}
-    - Budget: {state['user_profile'].get('budget_currency', '$')}{state['user_profile'].get('budget', 'N/A')}
-    - Goals: {state['user_profile'].get('investment_goals', 'N/A')}
+    system = (
+        f"You are a personal investment advisor. Consider ALL investment options — stocks, gold, bonds, ETFs, FDs, etc.\n"
+        f"Use tools only when you need current data to answer accurately. You may call none, one, or multiple tools.\n"
+        f"Today: {today}\n\n"
+        f"After gathering data (if needed), write a clear, structured, actionable response tailored to the user's profile.\n"
+        f"End with a short disclaimer that this is not financial advice."
+    )
 
-    USER QUESTION:
-    {state['user_query']}
+    human = (
+        f"USER PROFILE:\n"
+        f"- Risk Tolerance : {state['user_profile'].get('risk_tolerance', 'N/A')}\n"
+        f"- Horizon        : {state['user_profile'].get('investment_horizon', 'N/A')}\n"
+        f"- Budget         : {state['user_profile'].get('budget_currency', '$')}"
+        f"{state['user_profile'].get('budget', 'N/A')}\n"
+        f"- Goals          : {state['user_profile'].get('investment_goals', 'N/A')}\n\n"
+        f"QUESTION: {state['user_query']}"
+    )
 
-    CURRENT MARKET DATA ({today}):
-    Major Indices:
-    {indices_text}
+    messages = [SystemMessage(content=system), HumanMessage(content=human)]
+    tool_registry = {"search_web": search_web, "get_market_indices": get_market_indices}
 
-    Gold Price & Trend:
-    {gold_search}
+    final_advice = _run_react_loop(llm_with_tools, messages, tool_registry)
 
-    Silver Price & Trend:
-    {silver_search}
-
-    Recent Market News & Analysis:
-    {market_search}
-
-    Respond in a clear, structured format."""
-    
-    response = llm.invoke(prompt)
-    
     return {
-        "general_advice": response.content,
-        "market_conditions": f"Indices: {indices_text}\n\nMarket News: {market_search[:500]}...",
-        "messages": ["💡 General advice generated"]
+        "final_response": final_advice,
+        "messages": ["General advice generated"],
     }
 
-def format_general_response_node(state: InvestmentAgentState) -> Dict:
-    """Format the general advice response"""
-    run_id = uuid.uuid4().hex[:8]
-    print(f"[NODE RUN] format_general_response - ID: {run_id}")
-    
-    final_response = f"""
-    🤖 INVESTMENT GUIDANCE FOR YOU
-    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-    👤 YOUR PROFILE:
-    - Risk: {state['user_profile'].get('risk_tolerance', 'N/A').title()}
-    - Timeline: {state['user_profile'].get('investment_horizon', 'N/A')}
-    - Budget: {state['user_profile'].get('budget_currency', '$')}{state['user_profile'].get('budget', 'N/A'):,}
+def stock_analysis_agent(state: InvestmentAgentState) -> Dict:
+    """ReAct agent: fetches stock data + news via tools, then writes one complete report."""
+    print("[NODE] stock_analysis_agent")
+    llm = ChatGoogleGenerativeAI(
+        model=Model_Name, google_api_key=GEMINI_API_KEY, temperature=0.2
+    )
+    llm_with_tools = llm.bind_tools(
+        [fetch_stock_data, fetch_stock_news, calculate_what_if]
+    )
 
-    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    system = (
+        f"You are an expert stock analyst. Follow these steps:\n\n"
+        f"STEP 1 — Resolve the ticker symbol from the user query using your own knowledge.\n"
+        f"         Indian stocks: append .NS (NSE) or .BO (BSE). US stocks: no suffix needed.\n\n"
+        f"STEP 2 — Call fetch_stock_data with the resolved ticker symbol.\n\n"
+        f"STEP 3 — Call fetch_stock_news with '<TICKER> <CompanyName>' as the query.\n\n"
+        f"STEP 4 — Using data from the tools, write ONE complete investment report covering:\n"
+        f"  • Current price, daily change, market cap, sector, P/E ratio\n"
+        f"  • Business health: is the company growing and profitable?\n"
+        f"  • Valuation: is the stock cheap or expensive? Use simple analogies.\n"
+        f"  • Price momentum: where is it in the 52-week range? Trend direction?\n"
+        f"  • News sentiment: positive, negative, or mixed?\n"
+        f"  • 6-month price scenarios: bull case and bear case with % estimates\n"
+        f"  • Risk match: does this stock suit THIS specific investor's profile?\n"
+        f"  • Final verdict: BUY / WAIT / DON'T BUY — with clear reasons\n"
+        f"  • 2–3 alternative stocks in the same sector (include ticker symbols)\n\n"
+        f"USER PROFILE:\n"
+        f"- Risk Tolerance : {state['user_profile'].get('risk_tolerance', 'N/A')}\n"
+        f"- Horizon        : {state['user_profile'].get('investment_horizon', 'N/A')}\n"
+        f"- Budget         : {state['user_profile'].get('budget_currency', '$')}{state['user_profile'].get('budget', 'N/A')}\n"
+        f"- Goals          : {state['user_profile'].get('investment_goals', 'N/A')}\n\n"
+        f"Write in plain English — beginner-friendly but data-backed. End with a disclaimer."
+    )
 
-    {state['general_advice']}
+    messages = [
+        SystemMessage(content=system),
+        HumanMessage(content=f"Analyze: {state['user_query']}"),
+    ]
+    tool_registry = {
+        "fetch_stock_data": fetch_stock_data,
+        "fetch_stock_news": fetch_stock_news,
+        "calculate_what_if": calculate_what_if,
+    }
 
-    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    report = _run_react_loop(llm_with_tools, messages, tool_registry, max_iterations=5)
 
-    ⚠️ IMPORTANT DISCLAIMER: 
-    This analysis is for educational purposes only and is NOT financial advice. 
-    Markets are unpredictable. Always:
-    - Do your own research
-    - Consult with a qualified financial advisor
-    - Never invest money you can't afford to lose
-    - Diversify your investments
-    """
-    
     return {
-        "final_response": final_response,
-        "messages": ["✅ General advice formatted"]
+        "final_response": report,
+        "messages": ["Stock analysis complete"],
     }
 
 
 # ============================================================================
-# NODE FUNCTIONS - SINGLE STOCK PATH (EXISTING)
-# ============================================================================
-
-def resolve_symbol_node(state: InvestmentAgentState) -> Dict:
-    run_id = uuid.uuid4().hex[:8]
-    print(f"[NODE RUN] resolve_symbol - ID: {run_id}")
-    
-    llm = ChatGoogleGenerativeAI(
-        model=Model_Name,
-        google_api_key=GEMINI_API_KEY,
-        temperature=0
-    )
-    
-    resolution = resolve_stock_symbol(state['user_query'], llm)
-    
-    return {
-        "company_name": resolution["company_name"],
-        "stock_symbol": resolution["symbol"],
-        "exchange": resolution["exchange"],
-        "messages": [f"🔍 Resolved: {resolution['company_name']} ({resolution['symbol']})"]
-    }
-
-
-def gather_data_node(state: InvestmentAgentState) -> Dict:
-    run_id = uuid.uuid4().hex[:8]
-    print(f"[NODE RUN] gather_data - ID: {run_id}")
-    
-    symbol = state["stock_symbol"]
-    stock_data = fetch_global_stock_data(symbol)
-    
-    if "error" in stock_data:
-        base_symbol = symbol.split('.')[0]
-        alternate_symbols = [
-            f"{base_symbol}.NS",
-            f"{base_symbol}.BO",
-            base_symbol,
-            f"{base_symbol}.L"
-        ]
-        
-        for alt_symbol in alternate_symbols:
-            if alt_symbol != symbol:
-                print(f"Trying alternate: {alt_symbol}")
-                stock_data = fetch_global_stock_data(alt_symbol)
-                if "error" not in stock_data:
-                    symbol = alt_symbol
-                    break
-    
-    company_name = stock_data.get("company_name", state.get("company_name", symbol))
-    news = search_stock_news(symbol, company_name)
-    
-    return {
-        "stock_symbol": symbol,
-        "stock_data": stock_data,
-        "current_price": stock_data.get("price", 0),
-        "news_articles": news,
-        "messages": [f"✅ Data gathered for {symbol}"]
-    }
-
-
-def analyze_business_node(state: InvestmentAgentState) -> Dict:
-    run_id = uuid.uuid4().hex[:8]
-    print(f"[NODE RUN] analyze_business - ID: {run_id}")
-    
-    llm = ChatGoogleGenerativeAI(
-        model=Model_Name,
-        google_api_key=GEMINI_API_KEY,
-        temperature=0.3
-    )
-    
-    stock_data = state["stock_data"]
-    
-    rev_growth = stock_data.get('revenue_growth', 'N/A')
-    if rev_growth != 'N/A' and isinstance(rev_growth, (int, float)):
-        rev_growth = f"{rev_growth*100:.1f}%"
-    
-    profit_margin = stock_data.get('profit_margin', 'N/A')
-    if profit_margin != 'N/A' and isinstance(profit_margin, (int, float)):
-        profit_margin = f"{profit_margin*100:.1f}%"
-    
-    prompt = f"""Analyze the business health of {stock_data.get('company_name')} ({stock_data.get('country', 'N/A')}) in simple terms.
-
-DATA:
-- Industry: {stock_data.get('industry', 'N/A')}
-- Sector: {stock_data.get('sector', 'N/A')}
-- Revenue Growth: {rev_growth}
-- Profit Margin: {profit_margin}
-- Market Cap: {stock_data.get('market_cap', 'N/A')}
-
-Write 2-3 sentences in plain English about:
-1. Is the company growing and profitable?
-2. Is it financially healthy?
-3. Any concerns about the business?
-
-Be conversational and explain like talking to a beginner."""
-    
-    response = llm.invoke(prompt)
-    
-    return {
-        "business_analysis": response.content,
-        "messages": ["📊 Business analyzed"]
-    }
-
-
-def analyze_valuation_node(state: InvestmentAgentState) -> Dict:
-    run_id = uuid.uuid4().hex[:8]
-    print(f"[NODE RUN] analyze_valuation - ID: {run_id}")
-    
-    llm = ChatGoogleGenerativeAI(
-        model=Model_Name,
-        google_api_key=GEMINI_API_KEY,
-        temperature=0.3
-    )
-    
-    stock_data = state["stock_data"]
-    
-    prompt = f"""Explain if {stock_data.get('symbol')} is expensive or cheap RIGHT NOW.
-
-DATA:
-- P/E Ratio: {stock_data.get('pe_ratio', 'N/A')}
-- Forward P/E: {stock_data.get('forward_pe', 'N/A')}
-- Sector: {stock_data.get('sector', 'N/A')}
-- Industry: {stock_data.get('industry', 'N/A')}
-
-Write 3-4 sentences explaining:
-1. What does the P/E ratio mean in simple terms?
-2. Is this stock expensive compared to others in the same industry?
-3. Use analogies (like "paying $X for every $1 of profit")
-
-Make it crystal clear for beginners."""
-    
-    response = llm.invoke(prompt)
-    
-    return {
-        "valuation_analysis": response.content,
-        "messages": ["💸 Valuation analyzed"]
-    }
-
-
-def analyze_momentum_node(state: InvestmentAgentState) -> Dict:
-    run_id = uuid.uuid4().hex[:8]
-    print(f"[NODE RUN] analyze_momentum - ID: {run_id}")
-    
-    llm = ChatGoogleGenerativeAI(
-        model=Model_Name,
-        google_api_key=GEMINI_API_KEY,
-        temperature=0.3
-    )
-    
-    stock_data = state["stock_data"]
-    
-    prompt = f"""Describe the price momentum/trend for {stock_data.get('symbol')}.
-
-DATA:
-- Current: {stock_data.get('currency', '')} {stock_data.get('price')}
-- Today's Change: {stock_data.get('change_percent')}
-- 52-Week Range: {stock_data.get('currency', '')} {stock_data.get('52_week_low')} - {stock_data.get('currency', '')} {stock_data.get('52_week_high')}
-
-Write 2-3 sentences:
-1. Is the stock going up, down, or sideways recently?
-2. Where is it in its 52-week range (near highs/lows)?
-3. What does this tell us about investor sentiment?
-
-Simple language, no jargon."""
-    
-    response = llm.invoke(prompt)
-    
-    return {
-        "momentum_analysis": response.content,
-        "messages": ["📈 Momentum analyzed"]
-    }
-
-
-def analyze_news_node(state: InvestmentAgentState) -> Dict:
-    run_id = uuid.uuid4().hex[:8]
-    print(f"[NODE RUN] analyze_news - ID: {run_id}")
-    
-    llm = ChatGoogleGenerativeAI(
-        model=Model_Name,
-        google_api_key=GEMINI_API_KEY,
-        temperature=0.3
-    )
-    
-    news = state["news_articles"]
-    news_text = "\n".join([
-        f"- {article.get('title', '')} ({article.get('source', '')})"
-        for article in news[:5]
-    ])
-    
-    prompt = f"""Summarize the news sentiment about {state['stock_data'].get('symbol')}.
-
-NEWS:
-{news_text}
-
-Write 3-4 sentences:
-1. What's the GOOD news?
-2. What's the BAD/CONCERNING news?
-3. Overall: positive, negative, or mixed?
-
-Simple, conversational tone."""
-    
-    response = llm.invoke(prompt)
-    
-    return {
-        "news_sentiment": response.content,
-        "messages": ["📰 News analyzed"]
-    }
-
-
-def predict_price_node(state: InvestmentAgentState) -> Dict:
-    run_id = uuid.uuid4().hex[:8]
-    print(f"[NODE RUN] predict_price - ID: {run_id}")
-    
-    llm = ChatGoogleGenerativeAI(
-        model=Model_Name,
-        google_api_key=GEMINI_API_KEY,
-        temperature=0.3
-    )
-    
-    stock_data = state["stock_data"]
-    currency = stock_data.get('currency', 'USD')
-    
-    prompt = f"""Predict potential price ranges for {stock_data.get('symbol')} over 6 months.
-
-CURRENT DATA:
-- Price: {currency} {stock_data.get('price')}
-- P/E: {stock_data.get('pe_ratio')}
-- Sector: {stock_data.get('sector')}
-- Industry: {stock_data.get('industry')}
-- Country: {stock_data.get('country', 'N/A')}
-
-Provide TWO scenarios in this EXACT format:
-
-🎯 IF THINGS GO WELL: {currency} XXX - {currency} XXX (up/down X-X%)
-   Why? [1 sentence explaining what needs to happen]
-
-⚠️ IF THINGS GO WRONG: {currency} XXX - {currency} XXX (up/down X-X%)
-   Why? [1 sentence explaining what could go wrong]
-
-Be realistic. Use actual percentages. Keep it brief."""
-    
-    response = llm.invoke(prompt)
-    
-    return {
-        "price_prediction": response.content,
-        "messages": ["🎯 Predictions made"]
-    }
-
-
-def assess_risk_node(state: InvestmentAgentState) -> Dict:
-    run_id = uuid.uuid4().hex[:8]
-    print(f"[NODE RUN] assess_risk - ID: {run_id}")
-    
-    llm = ChatGoogleGenerativeAI(
-        model=Model_Name,
-        google_api_key=GEMINI_API_KEY,
-        temperature=0.3
-    )
-    
-    user_profile = state["user_profile"]
-    stock_data = state["stock_data"]
-    
-    prompt = f"""Does {stock_data.get('symbol')} match this investor's profile?
-
-INVESTOR:
-- Risk: {user_profile.get('risk_tolerance')}
-- Timeline: {user_profile.get('investment_horizon')}
-- Budget: {user_profile.get('budget_currency', '$')}{user_profile.get('budget')}
-
-STOCK:
-- Country: {stock_data.get('country', 'N/A')}
-- Sector: {stock_data.get('sector')}
-- Industry: {stock_data.get('industry', 'N/A')}
-- Volatility: [you judge based on P/E {stock_data.get('pe_ratio')} and sector]
-
-Write 2-3 sentences in this format:
-"⚠️ HONEST ANSWER: This is [GOOD/OKAY/NOT GOOD] match for you.
-
-[Explain why in simple terms - is it too risky? Too volatile? Timeline mismatch? Currency risk?]"
-
-Be brutally honest."""
-    
-    response = llm.invoke(prompt)
-    
-    return {
-        "risk_assessment": response.content,
-        "messages": ["⚠️ Risk assessed"]
-    }
-
-
-def generate_recommendation_node(state: InvestmentAgentState) -> Dict:
-    run_id = uuid.uuid4().hex[:8]
-    print(f"[NODE RUN] generate_recommendation - ID: {run_id}")
-    
-    llm = ChatGoogleGenerativeAI(
-        model=Model_Name,
-        google_api_key=GEMINI_API_KEY,
-        temperature=0.3
-    )
-    
-    prompt = f"""Give final investment verdict for {state['stock_data'].get('symbol')}.
-
-CONTEXT:
-User: {state['user_profile'].get('risk_tolerance')}, {state['user_profile'].get('investment_horizon')}, {state['user_profile'].get('budget_currency', '$')}{state['user_profile'].get('budget')}
-Price: {state['stock_data'].get('currency', '')} {state['current_price']}
-Business: {state['business_analysis'][:200]}
-Risk Match: {state['risk_assessment'][:200]}
-
-Provide in this EXACT format:
-
-✅ REASONS TO BUY:
-1. [Reason 1 - be specific]
-2. [Reason 2]
-3. [Reason 3]
-
-❌ REASONS NOT TO BUY (For YOUR situation):
-1. [Reason 1 - personalized to this user]
-2. [Reason 2]
-3. [Reason 3]
-
-🎯 FINAL ANSWER
-
-FOR YOU: [✅ BUY / ⚠️ WAIT / ❌ DON'T BUY RIGHT NOW]
-
-Why? [1-2 sentence summary]
-
-What to do instead:
-- [Specific action 1]
-- [Specific action 2]
-- CONSIDER ALTERNATIVES: [List 2-3 alternatives in the same sector/country with ticker symbols]
-
-If you really want {state['stock_data'].get('symbol')}:
-- [Risk mitigation strategy 1]
-- [Risk mitigation strategy 2]
-
-Be honest, direct, and actionable."""
-    
-    response = llm.invoke(prompt)
-    
-    return {
-        "recommendation": response.content,
-        "messages": ["💡 Recommendation ready"]
-    }
-
-
-def format_response_node(state: InvestmentAgentState) -> Dict:
-    run_id = uuid.uuid4().hex[:8]
-    print(f"[NODE RUN] format_response - ID: {run_id}")
-    
-    stock_data = state["stock_data"]
-    currency = stock_data.get('currency', 'USD')
-    
-    market_cap = stock_data.get('market_cap', 'N/A')
-    if market_cap != 'N/A' and market_cap:
-        try:
-            mc_float = float(market_cap)
-            if mc_float >= 1_000_000_000_000:
-                market_cap = f"{currency} {mc_float/1_000_000_000_000:.2f} Trillion"
-            elif mc_float >= 1_000_000_000:
-                market_cap = f"{currency} {mc_float/1_000_000_000:.2f} Billion"
-            else:
-                market_cap = f"{currency} {mc_float/1_000_000:.2f} Million"
-        except:
-            pass
-    
-    div_yield = stock_data.get('dividend_yield', 'N/A')
-    if div_yield != 'N/A' and isinstance(div_yield, (int, float)):
-        div_yield = f"{div_yield*100:.2f}%"
-    
-    final_response = f"""
-💰 {stock_data.get('company_name', 'N/A')} ({stock_data.get('symbol', 'N/A')})
-🌍 {stock_data.get('country', 'N/A')} | {stock_data.get('exchange', 'N/A')}
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-📊 RIGHT NOW
-Price: {currency} {stock_data.get('price', 'N/A')} ({stock_data.get('change_percent', 'N/A')} today)
-Market Cap: {market_cap}
-Sector: {stock_data.get('sector', 'N/A')}
-Industry: {stock_data.get('industry', 'N/A')}
-P/E Ratio: {stock_data.get('pe_ratio', 'N/A')}
-Dividend Yield: {div_yield}
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-📈 WHERE THE PRICE COULD GO (Next 6 months)
-
-{state['price_prediction']}
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-🔍 WHAT YOU NEED TO KNOW
-
-📊 THE BUSINESS
-{state['business_analysis']}
-
-💸 THE VALUATION
-{state['valuation_analysis']}
-
-📈 THE MOMENTUM
-{state['momentum_analysis']}
-
-📰 THE NEWS
-{state['news_sentiment']}
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-👤 DOES THIS MATCH YOU?
-
-Your Profile:
-- Risk: {state['user_profile'].get('risk_tolerance', 'N/A').title()}
-- Timeline: {state['user_profile'].get('investment_horizon', 'N/A')}
-- Budget: {state['user_profile'].get('budget_currency', '$')}{state['user_profile'].get('budget', 'N/A'):,}
-
-{state['risk_assessment']}
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-💡 SHOULD YOU BUY OR NOT?
-
-{state['recommendation']}
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-⚠️ DISCLAIMER: This is NOT financial advice. Always do your own research and consult a financial advisor before investing.
-"""
-    
-    return {
-        "final_response": final_response,
-        "messages": ["✅ Report complete"]
-    }
-
-
-# ============================================================================
-# GRAPH CONSTRUCTION
+# GRAPH — 3 nodes, clean routing, no dead edges
 # ============================================================================
 
 def create_investment_agent():
     workflow = StateGraph(InvestmentAgentState)
-    
-    # Add classifier node
+
     workflow.add_node("classify", classify_query_node)
-    
-    # Add off-topic handler
     workflow.add_node("handle_off_topic", handle_off_topic_node)
-    
-    # Add general advice path nodes
-    workflow.add_node("general_advisor", general_advisor_node)
-    workflow.add_node("format_general", format_general_response_node)
-    
-    # Add single stock path nodes
-    workflow.add_node("resolve_symbol", resolve_symbol_node)
-    workflow.add_node("gather_data", gather_data_node)
-    workflow.add_node("analyze_business", analyze_business_node)
-    workflow.add_node("analyze_valuation", analyze_valuation_node)
-    workflow.add_node("analyze_momentum", analyze_momentum_node)
-    workflow.add_node("analyze_news", analyze_news_node)
-    workflow.add_node("predict_price", predict_price_node)
-    workflow.add_node("assess_risk", assess_risk_node)
-    workflow.add_node("recommend", generate_recommendation_node)
-    workflow.add_node("format", format_response_node)
-    
-    # Set entry point
+    workflow.add_node("general_advisor", general_advisor_agent)
+    workflow.add_node("stock_analysis", stock_analysis_agent)
+
     workflow.set_entry_point("classify")
-    
-    # Conditional routing based on query type
+
     workflow.add_conditional_edges(
         "classify",
-        lambda state: state["query_type"],
+        lambda s: s["query_type"],
         {
-            "single_stock": "resolve_symbol",
+            "single_stock": "stock_analysis",
             "general_advice": "general_advisor",
-            "off_topic": "handle_off_topic"
-        }
+            "off_topic": "handle_off_topic",
+        },
     )
-    
-    # Off-topic path (shortest)
+
     workflow.add_edge("handle_off_topic", END)
-    
-    # General advice path
-    workflow.add_edge("general_advisor", "format_general")
-    workflow.add_edge("format_general", END)
-    
-    # Single stock path
-    workflow.add_edge("resolve_symbol", "gather_data")
-    workflow.add_edge("gather_data", "analyze_business")
-    workflow.add_edge("analyze_business", "analyze_valuation")
-    workflow.add_edge("analyze_valuation", "analyze_momentum")
-    workflow.add_edge("analyze_momentum", "analyze_news")
-    workflow.add_edge("analyze_news", "predict_price")
-    workflow.add_edge("predict_price", "assess_risk")
-    workflow.add_edge("assess_risk", "recommend")
-    workflow.add_edge("recommend", "format")
-    workflow.add_edge("format", END)
-    
+    workflow.add_edge("general_advisor", END)
+    workflow.add_edge("stock_analysis", END)
+
     return workflow.compile()
 
 
 # ============================================================================
-# MAIN EXECUTION
+# ENTRY POINT
 # ============================================================================
 
 def run_investment_agent(user_query: str, user_profile: Dict = None):
-    """
-    Run the investment analysis agent
-    
-    Args:
-        user_query: Any question (investment-related or not)
-        user_profile: User's investment profile
-    
-    Example queries:
-        Investment-related:
-        - "Should I invest in Apple?"
-        - "What stocks should I buy right now?"
-        - "Which sectors are performing well?"
-        
-        Off-topic (will be politely redirected):
-        - "Do you know Cristiano Ronaldo?"
-        - "How to make biryani"
-        - "Tell me a joke"
-    """
     if user_profile is None:
         user_profile = {
             "risk_tolerance": "moderate",
             "investment_horizon": "medium-term (1-3 years)",
             "budget": 5000,
             "budget_currency": "$",
-            "investment_goals": "growth with moderate risk"
+            "investment_goals": "growth with moderate risk",
         }
-    
+
     initial_state = {
         "user_query": user_query,
         "user_profile": user_profile,
         "query_type": "",
-        "company_name": "",
-        "stock_symbol": "",
-        "exchange": "",
-        "current_price": 0.0,
-        "stock_data": {},
-        "news_articles": [],
-        "market_conditions": "",
-        "business_analysis": "",
-        "valuation_analysis": "",
-        "momentum_analysis": "",
-        "news_sentiment": "",
-        "price_prediction": "",
-        "risk_assessment": "",
-        "recommendation": "",
-        "general_advice": "",
         "final_response": "",
-        "messages": []
+        "messages": [],
     }
-    
-    print("🤖 Analyzing your question...")
-    print("━" * 60)
-    
+
+    print("Analyzing your question...")
+    print("─" * 60)
+
     agent = create_investment_agent()
     final_state = agent.invoke(initial_state)
-    
+
     print("\n" + final_state["final_response"])
-    
     return final_state
